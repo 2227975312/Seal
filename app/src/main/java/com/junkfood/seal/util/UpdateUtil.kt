@@ -10,10 +10,15 @@ import com.junkfood.seal.App
 import com.junkfood.seal.App.Companion.context
 import com.junkfood.seal.R
 import com.junkfood.seal.util.FileUtil.getFileProvider
+import com.junkfood.seal.util.PreferenceUtil.getBoolean
 import com.junkfood.seal.util.PreferenceUtil.getInt
+import com.junkfood.seal.util.PreferenceUtil.getString
 import com.junkfood.seal.util.PreferenceUtil.updateLong
 import com.yausername.youtubedl_android.YoutubeDL
 import java.io.File
+import java.io.IOException
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -48,31 +53,278 @@ object UpdateUtil {
     private val requestForReleases =
         Request.Builder().url("https://api.github.com/repos/${OWNER}/${REPO}/releases").build()
 
-    private const val ytdlpNightlyBuildRelease =
+    private const val YT_DLP_ASSET = "yt-dlp"
+    private const val YT_DLP_SUMS_ASSET = "SHA2-256SUMS"
+    private const val DEFAULT_GITHUB_MIRROR = "https://gh-proxy.com"
+    private const val SHA256_HEX_LENGTH = 64
+    private val WHITESPACE = Regex("\\s+")
+
+    private const val YT_DLP_STABLE_API =
+        "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+    private const val YT_DLP_NIGHTLY_API =
         "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest"
+    private const val YT_DLP_STABLE_RELEASE_URL =
+        "https://github.com/yt-dlp/yt-dlp/releases/download"
+    private const val YT_DLP_NIGHTLY_RELEASE_URL =
+        "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download"
+
+    /** Preferences owned by youtubedl-android, kept in sync so that its version lookup works. */
+    private const val YTDLP_PREFS = "youtubedl-android"
+
+    private const val YTDLP_VERSION_KEY = "dlpVersion"
+    private const val YTDLP_VERSION_NAME_KEY = "dlpVersionName"
+    private const val MIN_YTDLP_SIZE = 1_000_000L
 
     private val jsonFormat = Json { ignoreUnknownKeys = true }
 
+    /** The default timeouts are too short for downloading several MB through a mirror. */
+    private val updateClient: OkHttpClient by lazy {
+        client
+            .newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.MINUTES)
+            .build()
+    }
+
     suspend fun updateYtDlp(): YoutubeDL.UpdateStatus? =
         withContext(Dispatchers.IO) {
-            val channel =
-                when (YT_DLP_UPDATE_CHANNEL.getInt()) {
-                    YT_DLP_NIGHTLY -> YoutubeDL.UpdateChannel.NIGHTLY
-                    else -> YoutubeDL.UpdateChannel.STABLE
+            val channel = YT_DLP_UPDATE_CHANNEL.getInt()
+            val mirror =
+                if (GITHUB_MIRROR_ENABLED.getBoolean()) {
+                    GITHUB_MIRROR.getString().toMirrorPrefix().ifEmpty { DEFAULT_GITHUB_MIRROR }
+                } else {
+                    ""
                 }
 
-            YoutubeDL.getInstance()
-                .updateYoutubeDL(appContext = context, updateChannel = channel)
-                .also {
-                    if (it == YoutubeDL.UpdateStatus.DONE) {
-                        YoutubeDL.getInstance().version(context)?.let {
-                            PreferenceUtil.encodeString(YT_DLP_VERSION, it)
-                        }
-                    }
-                    val now = System.currentTimeMillis()
-                    YT_DLP_UPDATE_TIME.updateLong(now)
+            val status =
+                if (mirror.isEmpty()) {
+                    updateYtDlpWithYoutubeDL(channel)
+                } else {
+                    updateYtDlpWithMirror(channel, mirror)
                 }
+
+            YT_DLP_UPDATE_TIME.updateLong(System.currentTimeMillis())
+            status
         }
+
+    private fun updateYtDlpWithYoutubeDL(channel: Int): YoutubeDL.UpdateStatus? {
+        val updateChannel =
+            when (channel) {
+                YT_DLP_NIGHTLY -> YoutubeDL.UpdateChannel.NIGHTLY
+                else -> YoutubeDL.UpdateChannel.STABLE
+            }
+        return YoutubeDL.getInstance()
+            .updateYoutubeDL(appContext = context, updateChannel = updateChannel)
+            .also { status ->
+                if (status == YoutubeDL.UpdateStatus.DONE) {
+                    YoutubeDL.getInstance().version(context)?.let { version ->
+                        PreferenceUtil.encodeString(YT_DLP_VERSION, version)
+                    }
+                }
+            }
+    }
+
+    private fun updateYtDlpWithMirror(channel: Int, mirror: String): YoutubeDL.UpdateStatus {
+        val nightly = channel == YT_DLP_NIGHTLY
+        val apiUrl = if (nightly) YT_DLP_NIGHTLY_API else YT_DLP_STABLE_API
+        val releaseUrl = if (nightly) YT_DLP_NIGHTLY_RELEASE_URL else YT_DLP_STABLE_RELEASE_URL
+
+        val release = fetchRelease(apiUrl, mirror)
+        val tag =
+            release.tagName?.takeIf { it.isNotBlank() }
+                ?: throw IOException("Missing tag name in release response")
+
+        if (tag == readYtdlpPref(YTDLP_VERSION_KEY)) {
+            return YoutubeDL.UpdateStatus.ALREADY_UP_TO_DATE
+        }
+
+        // Build both URLs from the resolved tag instead of trusting the release JSON, so a
+        // tampered API response cannot point the checksum at an attacker controlled URL.
+        val assetUrl = "$releaseUrl/$tag/$YT_DLP_ASSET"
+        val sumsUrl = "$releaseUrl/$tag/$YT_DLP_SUMS_ASSET"
+
+        val downloaded = downloadYtDlpAsset(assetUrl, mirror)
+        try {
+            verifyChecksum(downloaded, sumsUrl, mirror)
+            installYtDlp(downloaded)
+        } finally {
+            downloaded.delete()
+        }
+
+        writeYtdlpPref(YTDLP_VERSION_KEY, tag)
+        writeYtdlpPref(YTDLP_VERSION_NAME_KEY, release.name ?: tag)
+        PreferenceUtil.encodeString(YT_DLP_VERSION, tag)
+        Log.i(TAG, "yt-dlp updated to $tag")
+        return YoutubeDL.UpdateStatus.DONE
+    }
+
+    private fun fetchRelease(apiUrl: String, mirror: String): Release {
+        var lastError: Exception? = null
+        for (url in apiUrl.mirroredBy(mirror)) {
+            try {
+                val request =
+                    Request.Builder()
+                        .url(url)
+                        .header("Accept", "application/vnd.github+json")
+                        .header("User-Agent", "Seal")
+                        .build()
+                updateClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} for $url")
+                    return jsonFormat.decodeFromString<Release>(response.body.string())
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get release info from $url", e)
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("Failed to get release info")
+    }
+
+    private fun downloadYtDlpAsset(assetUrl: String, mirror: String): File {
+        var lastError: Exception? = null
+        for (url in assetUrl.mirroredBy(mirror)) {
+            val tempFile = File.createTempFile(YT_DLP_ASSET, null, context.cacheDir)
+            try {
+                val request = Request.Builder().url(url).build()
+                updateClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} for $url")
+                    response.body.byteStream().use { input ->
+                        tempFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+                // A mirror may answer with an HTML error page or a truncated file
+                if (tempFile.length() < MIN_YTDLP_SIZE || !tempFile.hasZipAppHeader()) {
+                    throw IOException("Unexpected payload from $url")
+                }
+                return tempFile
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to download yt-dlp from $url", e)
+                tempFile.delete()
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("Failed to download yt-dlp")
+    }
+
+    /** Returns the mirror-prefixed URL first, followed by the original URL as a fallback. */
+    private fun String.mirroredBy(mirror: String) =
+        if (mirror.isEmpty()) listOf(this) else listOf("$mirror/$this", this)
+
+    /** Returns the original URL first, followed by its mirrored counterpart as a fallback. */
+    private fun String.directThenMirrored(mirror: String) =
+        if (mirror.isEmpty()) listOf(this) else listOf(this, "$mirror/$this")
+
+    /**
+     * Verifies the downloaded bundle against the release checksum. The checksum is fetched from
+     * GitHub directly first, so a tampered mirror payload gets rejected. The mirrored checksum is
+     * only used when GitHub itself is unreachable.
+     */
+    private fun verifyChecksum(downloaded: File, sumsUrl: String, mirror: String) {
+        val expected = fetchExpectedChecksum(sumsUrl, mirror)
+        val actual = downloaded.sha256()
+        if (!actual.equals(expected, ignoreCase = true)) {
+            throw IOException(
+                "Checksum mismatch for $YT_DLP_ASSET (expected $expected, got $actual)"
+            )
+        }
+        Log.i(TAG, "$YT_DLP_ASSET checksum verified")
+    }
+
+    private fun fetchExpectedChecksum(sumsUrl: String, mirror: String): String {
+        var lastError: Exception? = null
+        for (url in sumsUrl.directThenMirrored(mirror)) {
+            try {
+                val sums =
+                    updateClient.newCall(Request.Builder().url(url).build()).execute().use {
+                        response ->
+                        if (!response.isSuccessful) {
+                            throw IOException("HTTP ${response.code} for $url")
+                        }
+                        response.body.string()
+                    }
+                return sums
+                    .lineSequence()
+                    .map { it.trim().split(WHITESPACE) }
+                    .firstOrNull { it.size >= 2 && it[1].trimStart('*') == YT_DLP_ASSET }
+                    ?.first()
+                    ?.takeIf { it.length == SHA256_HEX_LENGTH }
+                    ?: throw IOException("No checksum for $YT_DLP_ASSET in $url")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get checksum from $url", e)
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("Failed to get checksum for $YT_DLP_ASSET")
+    }
+
+    private fun File.sha256(): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString(separator = "") { "%02x".format(it) }
+    }
+
+    private fun String.toMirrorPrefix(): String {
+        val prefix = trim().trimEnd('/')
+        if (prefix.isEmpty()) return ""
+        return when {
+            prefix.startsWith("http://") || prefix.startsWith("https://") -> prefix
+            else -> "https://$prefix"
+        }
+    }
+
+    private fun File.hasZipAppHeader(): Boolean {
+        val header = ByteArray(4)
+        val read = inputStream().use { it.read(header) }
+        if (read < 2) return false
+        val text = String(header, 0, read, Charsets.US_ASCII)
+        return text.startsWith("#!") || text.startsWith("PK")
+    }
+
+    /** Replaces the yt-dlp bundle used by youtubedl-android, keeping the old one for rollback. */
+    private fun installYtDlp(source: File) {
+        val ytdlpDir =
+            File(File(context.noBackupFilesDir, YoutubeDL.baseName), YoutubeDL.ytdlpDirName)
+        if (!ytdlpDir.exists() && !ytdlpDir.mkdirs()) {
+            throw IOException("Failed to create ${ytdlpDir.absolutePath}")
+        }
+
+        val target = File(ytdlpDir, YoutubeDL.ytdlpBin)
+        val incoming = File(ytdlpDir, "${target.name}.new")
+        val backup = File(ytdlpDir, "${target.name}.bak")
+
+        source.copyTo(incoming, overwrite = true)
+        try {
+            if (target.exists()) target.copyTo(backup, overwrite = true)
+            if (!incoming.renameTo(target)) {
+                target.delete()
+                if (!incoming.renameTo(target)) throw IOException("Failed to install yt-dlp")
+            }
+            backup.delete()
+        } catch (e: Exception) {
+            incoming.delete()
+            if (backup.exists()) backup.copyTo(target, overwrite = true)
+            throw e
+        }
+    }
+
+    private fun readYtdlpPref(key: String): String? =
+        context.getSharedPreferences(YTDLP_PREFS, Context.MODE_PRIVATE).getString(key, null)
+
+    private fun writeYtdlpPref(key: String, value: String) {
+        context
+            .getSharedPreferences(YTDLP_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(key, value)
+            .apply()
+    }
 
     private fun getLatestRelease(): Release =
         client.newCall(requestForReleases).execute().body.use {

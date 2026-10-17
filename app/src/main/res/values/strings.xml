@@ -265,6 +265,10 @@
     <string name="update_channel_desc">Install pre-release builds to preview new features and changes.\n\nThere will be some instability in these versions, so please don\'t hesitate to give us feedback if you experience any problems to help us improve the app for the future.</string>
     <string name="update_channel">Update channel</string>
     <string name="auto_update">Auto update</string>
+    <string name="github_mirror">GitHub mirror</string>
+    <string name="github_mirror_desc">Download yt-dlp through a GitHub proxy. The checksum is always verified against GitHub directly, and only falls back to the mirror when GitHub is unreachable.</string>
+    <string name="github_mirror_hint">https://gh-proxy.com/</string>
+    <string name="github_mirror_input_desc">Leave empty to use the default mirror.</string>
     <string name="enable_auto_update">Enable auto update</string>
     <string name="discard">Discard</string>
     <string name="apply">Apply</string>

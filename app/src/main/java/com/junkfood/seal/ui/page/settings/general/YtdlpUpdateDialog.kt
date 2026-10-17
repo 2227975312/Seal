@@ -1,6 +1,7 @@
 package com.junkfood.seal.ui.page.settings.general
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -8,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -22,6 +24,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.contentColorFor
 import androidx.compose.runtime.Composable
@@ -42,11 +45,15 @@ import com.junkfood.seal.ui.common.intState
 import com.junkfood.seal.ui.component.ConfirmButton
 import com.junkfood.seal.ui.component.DismissButton
 import com.junkfood.seal.ui.component.SealDialog
+import com.junkfood.seal.util.GITHUB_MIRROR
+import com.junkfood.seal.util.GITHUB_MIRROR_ENABLED
 import com.junkfood.seal.util.PreferenceStrings.getUpdateIntervalText
 import com.junkfood.seal.util.PreferenceUtil.getLong
+import com.junkfood.seal.util.PreferenceUtil.getString
 import com.junkfood.seal.util.PreferenceUtil.updateBoolean
 import com.junkfood.seal.util.PreferenceUtil.updateInt
 import com.junkfood.seal.util.PreferenceUtil.updateLong
+import com.junkfood.seal.util.PreferenceUtil.updateString
 import com.junkfood.seal.util.UpdateIntervalList
 import com.junkfood.seal.util.YT_DLP_AUTO_UPDATE
 import com.junkfood.seal.util.YT_DLP_NIGHTLY
@@ -100,6 +107,8 @@ fun YtdlpUpdateChannelDialog(modifier: Modifier = Modifier, onDismissRequest: ()
     var ytdlpUpdateChannel by YT_DLP_UPDATE_CHANNEL.intState
     var ytdlpAutoUpdate by YT_DLP_AUTO_UPDATE.booleanState
     var updateInterval by remember { mutableLongStateOf(YT_DLP_UPDATE_INTERVAL.getLong()) }
+    var githubMirror by remember { mutableStateOf(GITHUB_MIRROR.getString()) }
+    var githubMirrorEnabled by GITHUB_MIRROR_ENABLED.booleanState
 
     SealDialog(
         modifier = modifier,
@@ -109,6 +118,8 @@ fun YtdlpUpdateChannelDialog(modifier: Modifier = Modifier, onDismissRequest: ()
                 YT_DLP_AUTO_UPDATE.updateBoolean(ytdlpAutoUpdate)
                 YT_DLP_UPDATE_CHANNEL.updateInt(ytdlpUpdateChannel)
                 YT_DLP_UPDATE_INTERVAL.updateLong(updateInterval)
+                GITHUB_MIRROR_ENABLED.updateBoolean(githubMirrorEnabled)
+                GITHUB_MIRROR.updateString(githubMirror.trim())
                 onDismissRequest()
             }
         },
@@ -145,6 +156,53 @@ fun YtdlpUpdateChannelDialog(modifier: Modifier = Modifier, onDismissRequest: ()
                         labelContainerColor = MaterialTheme.colorScheme.tertiary,
                     ) {
                         ytdlpUpdateChannel = YT_DLP_NIGHTLY
+                    }
+                }
+                item {
+                    Row(
+                        modifier =
+                            Modifier.fillMaxWidth()
+                                .toggleable(
+                                    value = githubMirrorEnabled,
+                                    onValueChange = { githubMirrorEnabled = it },
+                                )
+                                .padding(horizontal = 24.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(id = R.string.github_mirror),
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                            Text(
+                                text = stringResource(id = R.string.github_mirror_desc),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = githubMirrorEnabled,
+                            onCheckedChange = null,
+                            modifier = Modifier.padding(start = 16.dp),
+                        )
+                    }
+                }
+                if (githubMirrorEnabled) {
+                    item {
+                        OutlinedTextField(
+                            value = githubMirror,
+                            onValueChange = { githubMirror = it },
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                            label = { Text(text = stringResource(id = R.string.github_mirror)) },
+                            placeholder = {
+                                Text(text = stringResource(id = R.string.github_mirror_hint))
+                            },
+                            supportingText = {
+                                Text(text = stringResource(id = R.string.github_mirror_input_desc))
+                            },
+                            singleLine = true,
+                        )
                     }
                 }
                 item {
