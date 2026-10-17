@@ -403,8 +403,7 @@ fun DownloadPageImpl(
                     ) {
                         TooltipBox(
                             state = rememberTooltipState(),
-                            positionProvider =
-                                TooltipDefaults.rememberTooltipPositionProvider(),
+                            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(),
                             tooltip = {
                                 PlainTooltip {
                                     Text(text = stringResource(id = R.string.running_tasks))
